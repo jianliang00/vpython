@@ -56,6 +56,8 @@ reinstalls as needed, storing metadata in `.venv/.pywrap/ok.json`.
 * `PYWRAP_FORCE_RECREATE`: Set to `1` to delete and recreate the venv on every run.
 * `PYWRAP_UPGRADE_PIP`: Set to `0` to skip upgrading `pip`, `setuptools`, and `wheel`
   before installs (defaults to `1`).
+* `PYWRAP_LOCAL_FIRST`: Set to `1` to run `pip download` before installs and then
+  install from the local download cache via `pip install --no-index --find-links`.
 * `PYWRAP_PIP_ARGS`: Extra arguments passed to `pip` (e.g. `--index-url`, `--extra-index-url`).
 * `PYWRAP_LOCK_TIMEOUT_SEC`: Seconds to wait for the venv lock (default: `1800`).
 * `PYWRAP_LOCK_POLL_SEC`: Lock polling interval in seconds (default: `0.2`).
