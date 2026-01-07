@@ -51,8 +51,8 @@ reinstalls as needed, storing metadata in `.venv/.pywrap/ok.json`.
 * `PYWRAP_CACHE_DIR`: Override the cache root when `PYWRAP_VENV_MODE=cache`.
 * `PYWRAP_DEP_MODE`: `requirements`, `pyproject`, or `none` (auto-detected if unset).
 * `PYWRAP_REQUIREMENTS`: Path to the requirements file (default: `<project_root>/requirements.txt`).
-* `PYWRAP_NO_INSTALL`: Set to `1` to skip installing dependencies even if the marker
-  hash has changed.
+* `PYWRAP_INSTALL_DEPS`: Set to `1` to install dependencies when the marker hash has
+  changed (defaults to `0`).
 * `PYWRAP_FORCE_RECREATE`: Set to `1` to delete and recreate the venv on every run.
 * `PYWRAP_UPGRADE_PIP`: Set to `0` to skip upgrading `pip`, `setuptools`, and `wheel`
   before installs (defaults to `1`).

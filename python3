@@ -360,7 +360,7 @@ def main(argv: list[str]) -> int:
 
     # new knobs (backward-compatible)
     force_recreate = _bool_env("PYWRAP_FORCE_RECREATE", False)
-    no_install = _bool_env("PYWRAP_NO_INSTALL", False)
+    install_deps = _bool_env("PYWRAP_INSTALL_DEPS", False)
     upgrade_pip = _bool_env("PYWRAP_UPGRADE_PIP", True)
     lock_timeout = _int_env("PYWRAP_LOCK_TIMEOUT_SEC", 1800)
     lock_poll = _float_env("PYWRAP_LOCK_POLL_SEC", 0.2)
@@ -415,7 +415,7 @@ def main(argv: list[str]) -> int:
                 and marker.get("base_python") == str(base_python)
             )
 
-            if not marker_ok and not no_install:
+            if not marker_ok and install_deps:
                 if dep_mode != "none":
                     _install_deps(
                         venv_dir,
@@ -439,8 +439,8 @@ def main(argv: list[str]) -> int:
                         "pip_args": pip_args,
                     },
                 )
-            elif not marker_ok and no_install:
-                _log(verbose, "marker mismatch but PYWRAP_NO_INSTALL=1; skipping dependency install")
+            elif not marker_ok and not install_deps:
+                _log(verbose, "marker mismatch but PYWRAP_INSTALL_DEPS=0; skipping dependency install")
 
     py = _venv_python(venv_dir)
     os.execv(str(py), [str(py), *argv])
