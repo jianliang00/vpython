@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -51,6 +52,18 @@ class WrapperTests(unittest.TestCase):
         )
         return env
 
+    def _run_wrapper(self, cwd: str, env: dict, args: list[str] | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(WRAPPER_PATH), *(args or ["-c", "print('ok')"])],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def _venv_dir(self, project_root: Path) -> Path:
+        return project_root / ".venv"
+
     def test_concurrent_invocations_share_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._base_env()
@@ -80,6 +93,7 @@ class WrapperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self._base_env()
             env["PYWRAP_LOCK_TIMEOUT_SEC"] = "1"
+            env["PYWRAP_LOCK_POLL_SEC"] = "0.01"
             lock_path = str(Path(tmpdir) / ".venv.lock")
             ctx = get_context("spawn")
             ready = ctx.Event()
@@ -117,6 +131,84 @@ class WrapperTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("[pywrap]", result.stderr)
+
+    def test_verbose_logs_dep_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+            env["PYWRAP_VERBOSE"] = "1"
+            env["PYWRAP_DEP_MODE"] = "requirements"
+
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("[pywrap] project_root=", result.stderr)
+            self.assertIn("dep_mode=requirements", result.stderr)
+
+    def test_requirements_env_override_selects_requirements_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            custom_req = Path(tmpdir, "custom-req.txt")
+            custom_req.write_text("", encoding="utf-8")
+            env = self._base_env()
+            env["PYWRAP_VERBOSE"] = "1"
+            env["PYWRAP_REQUIREMENTS"] = str(custom_req)
+
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("dep_mode=requirements", result.stderr)
+
+    def test_cache_mode_uses_cache_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as cache_dir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+            env["PYWRAP_VERBOSE"] = "1"
+            env["PYWRAP_VENV_MODE"] = "cache"
+            env["PYWRAP_CACHE_DIR"] = cache_dir
+
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            venv_dir_line = next(
+                (line for line in result.stderr.splitlines() if "venv_dir=" in line),
+                "",
+            )
+            self.assertIn(str(Path(cache_dir)), venv_dir_line)
+            self.assertFalse(self._venv_dir(Path(tmpdir)).exists())
+
+    def test_force_recreate_removes_existing_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            venv_dir = self._venv_dir(Path(tmpdir))
+            sentinel = venv_dir / "sentinel.txt"
+            sentinel.write_text("old", encoding="utf-8")
+
+            env["PYWRAP_FORCE_RECREATE"] = "1"
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(venv_dir.exists())
+            self.assertFalse(sentinel.exists())
+
+    def test_install_deps_writes_marker_with_pip_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+            env["PYWRAP_INSTALL_DEPS"] = "1"
+            env["PYWRAP_UPGRADE_PIP"] = "0"
+            env["PYWRAP_PIP_ARGS"] = "--no-index"
+
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            marker = self._venv_dir(Path(tmpdir)) / ".pywrap" / "ok.json"
+            data = json.loads(marker.read_text("utf-8"))
+            self.assertEqual(data["pip_args"], ["--no-index"])
 
 
 if __name__ == "__main__":
