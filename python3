@@ -300,54 +300,72 @@ def _install_deps(
     *,
     upgrade_pip: bool,
     pip_args: list[str],
+    local_first: bool,
 ) -> None:
     py = _venv_python(venv_dir)
+    download_dir = None
 
-    if upgrade_pip:
+    def _pip_install(args: list[str]) -> None:
+        if not local_first:
+            subprocess.run(
+                [
+                    str(py),
+                    "-m",
+                    "pip",
+                    "install",
+                    *args,
+                    "--disable-pip-version-check",
+                    *pip_args,
+                ],
+                check=True,
+            )
+            return
+
+        nonlocal download_dir
+        if download_dir is None:
+            download_dir = tempfile.mkdtemp(prefix=".tmp-pip-download-")
+
+        subprocess.run(
+            [
+                str(py),
+                "-m",
+                "pip",
+                "download",
+                *args,
+                "-d",
+                download_dir,
+                "--disable-pip-version-check",
+                *pip_args,
+            ],
+            check=True,
+        )
         subprocess.run(
             [
                 str(py),
                 "-m",
                 "pip",
                 "install",
-                "--upgrade",
-                "pip",
-                "setuptools",
-                "wheel",
+                "--no-index",
+                "--find-links",
+                download_dir,
+                *args,
                 "--disable-pip-version-check",
                 *pip_args,
             ],
             check=True,
         )
 
-    if dep_mode == "requirements" and req_file.is_file():
-        subprocess.run(
-            [
-                str(py),
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                str(req_file),
-                "--disable-pip-version-check",
-                *pip_args,
-            ],
-            check=True,
-        )
-    elif dep_mode == "pyproject":
-        subprocess.run(
-            [
-                str(py),
-                "-m",
-                "pip",
-                "install",
-                "-e",
-                str(project_root),
-                "--disable-pip-version-check",
-                *pip_args,
-            ],
-            check=True,
-        )
+    try:
+        if upgrade_pip:
+            _pip_install(["--upgrade", "pip", "setuptools", "wheel"])
+
+        if dep_mode == "requirements" and req_file.is_file():
+            _pip_install(["-r", str(req_file)])
+        elif dep_mode == "pyproject":
+            _pip_install(["-e", str(project_root)])
+    finally:
+        if download_dir:
+            shutil.rmtree(download_dir, ignore_errors=True)
 
 
 def main(argv: list[str]) -> int:
@@ -365,6 +383,7 @@ def main(argv: list[str]) -> int:
     lock_timeout = _int_env("PYWRAP_LOCK_TIMEOUT_SEC", 1800)
     lock_poll = _float_env("PYWRAP_LOCK_POLL_SEC", 0.2)
     pip_args = shlex.split(os.environ.get("PYWRAP_PIP_ARGS", "").strip())
+    local_first = _bool_env("PYWRAP_LOCAL_FIRST", False)
 
     cwd = Path.cwd()
     project_root = _find_project_root(cwd)
@@ -424,6 +443,7 @@ def main(argv: list[str]) -> int:
                         req_file,
                         upgrade_pip=upgrade_pip,
                         pip_args=pip_args,
+                        local_first=local_first,
                     )
 
                 _write_marker(
@@ -437,6 +457,7 @@ def main(argv: list[str]) -> int:
                         "created_at": int(time.time()),
                         "python_version": sys.version,
                         "pip_args": pip_args,
+                        "local_first": local_first,
                     },
                 )
             elif not marker_ok and not install_deps:
