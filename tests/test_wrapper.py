@@ -225,6 +225,22 @@ class WrapperTests(unittest.TestCase):
             data = json.loads(marker.read_text("utf-8"))
             self.assertTrue(data["local_first"])
 
+    @unittest.skipUnless(os.name == "nt", "Windows-only test for python3.cmd shim")
+    def test_windows_cmd_shim_invokes_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._base_env()
+            env["PYWRAP_VENV_MODE"] = "project"
+            result = subprocess.run(
+                ["cmd", "/c", "python3.cmd", "-c", "print('ok')"],
+                cwd=str(WRAPPER_PATH.parent),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "ok")
+
 
 if __name__ == "__main__":
     unittest.main()
