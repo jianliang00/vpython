@@ -226,6 +226,21 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "ok")
 
+    def test_local_first_records_marker_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+            env["PYWRAP_INSTALL_DEPS"] = "1"
+            env["PYWRAP_UPGRADE_PIP"] = "0"
+            env["PYWRAP_LOCAL_FIRST"] = "1"
+
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            marker = self._venv_dir(Path(tmpdir)) / ".pywrap" / "ok.json"
+            data = json.loads(marker.read_text("utf-8"))
+            self.assertTrue(data["local_first"])
+
 
 if __name__ == "__main__":
     unittest.main()
