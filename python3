@@ -120,6 +120,14 @@ class FileLock:
         self.verbose = verbose
         self._fd: int | None = None
 
+    def _nt_seek0(self) -> None:
+        # msvcrt.locking() locks/unlocks from *current file position*.
+        # Always reset offset so we operate on the same byte-range.
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
+
     def acquire(self) -> None:
         start = time.time()
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +143,15 @@ class FileLock:
                 else:
                     import msvcrt
 
+                    # Ensure file has at least 1 byte to lock (optional but recommended)
+                    try:
+                        st = os.fstat(fd)
+                        if st.st_size == 0:
+                            os.write(fd, b"\0")
+                    except OSError:
+                        pass
+
+                    self._nt_seek0()
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
                 # best-effort: write owner metadata for debugging
@@ -172,6 +189,7 @@ class FileLock:
             else:
                 import msvcrt
 
+                self._nt_seek0()
                 msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
         finally:
             os.close(self._fd)
