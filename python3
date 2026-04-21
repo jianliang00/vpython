@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any, Optional
 
 _LOCK = threading.RLock()
 
@@ -113,12 +114,21 @@ class FileLock:
     the OS closes file descriptors and releases the lock automatically.
     """
 
-    def __init__(self, lock_path: Path, *, timeout_sec: int = 1800, poll_sec: float = 0.2, verbose: bool = False):
+    def __init__(
+        self,
+        lock_path: Path,
+        *,
+        timeout_sec: float = 1800,
+        poll_sec: float = 0.2,
+        verbose: bool = False,
+        inherit_across_exec: bool = False,
+    ):
         self.lock_path = lock_path
         self.timeout_sec = timeout_sec
         self.poll_sec = poll_sec
         self.verbose = verbose
-        self._fd: int | None = None
+        self.inherit_across_exec = inherit_across_exec
+        self._fd: Optional[int] = None
 
     def _nt_seek0(self) -> None:
         # msvcrt.locking() locks/unlocks from *current file position*.
@@ -132,6 +142,8 @@ class FileLock:
         start = time.time()
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        if self.inherit_across_exec:
+            os.set_inheritable(fd, True)
         self._fd = fd
 
         while True:
@@ -219,6 +231,11 @@ def _remove_venv(venv_dir: Path) -> None:
         shutil.rmtree(venv_dir, ignore_errors=True)
 
 
+def _tmp_venv_prefix(venv_dir: Path) -> str:
+    token = hashlib.sha256(str(venv_dir).encode("utf-8")).hexdigest()[:12]
+    return f".tmp-venv-{token}-"
+
+
 def _ensure_venv(base_python: Path, venv_dir: Path, *, force_recreate: bool) -> None:
     parent = venv_dir.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -233,7 +250,7 @@ def _ensure_venv(base_python: Path, venv_dir: Path, *, force_recreate: bool) -> 
     if venv_dir.exists():
         return
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix=".tmp-venv-", dir=str(parent)))
+    tmp_dir = Path(tempfile.mkdtemp(prefix=_tmp_venv_prefix(venv_dir), dir=str(parent)))
     try:
         subprocess.run([str(base_python), "-m", "venv", str(tmp_dir)], check=True)
         py = _venv_python(tmp_dir)
@@ -249,15 +266,89 @@ def _marker_path(venv_dir: Path) -> Path:
     return venv_dir / ".pywrap" / "ok.json"
 
 
-def _load_marker(venv_dir: Path):
+def _pending_marker_path(venv_dir: Path) -> Path:
+    return venv_dir / ".pywrap" / "installing.json"
+
+
+def _runtime_dir(venv_dir: Path) -> Path:
+    return venv_dir / ".pywrap" / "running"
+
+
+def _load_json(path: Path) -> Optional[dict[str, Any]]:
     try:
-        return json.loads(_marker_path(venv_dir).read_text("utf-8"))
+        data = json.loads(path.read_text("utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
 
+def _load_marker(venv_dir: Path) -> Optional[dict[str, Any]]:
+    return _load_json(_marker_path(venv_dir))
+
+
+def _load_pending_marker(venv_dir: Path) -> Optional[dict[str, Any]]:
+    return _load_json(_pending_marker_path(venv_dir))
+
+
 def _write_marker(venv_dir: Path, data: dict) -> None:
     _atomic_write_text(_marker_path(venv_dir), json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
+
+
+def _write_pending_marker(venv_dir: Path, data: dict) -> None:
+    _atomic_write_text(_pending_marker_path(venv_dir), json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
+
+
+def _clear_pending_marker(venv_dir: Path) -> None:
+    _pending_marker_path(venv_dir).unlink(missing_ok=True)
+
+
+def _runtime_lease_path(venv_dir: Path) -> Path:
+    token = hashlib.sha256(f"{os.getpid()}:{time.time_ns()}".encode("utf-8")).hexdigest()[:16]
+    return _runtime_dir(venv_dir) / f"{token}.lock"
+
+
+def _try_lock_once(lock_path: Path, *, inherit_across_exec: bool = False) -> Optional[FileLock]:
+    lock = FileLock(
+        lock_path,
+        timeout_sec=0,
+        poll_sec=0,
+        inherit_across_exec=inherit_across_exec,
+    )
+    try:
+        lock.acquire()
+        return lock
+    except TimeoutError:
+        return None
+
+
+def _prune_runtime_leases(venv_dir: Path) -> list[Path]:
+    runtime_dir = _runtime_dir(venv_dir)
+    if not runtime_dir.exists():
+        return []
+
+    active: list[Path] = []
+    for lease_path in runtime_dir.glob("*.lock"):
+        probe = _try_lock_once(lease_path)
+        if probe is None:
+            active.append(lease_path)
+            continue
+        try:
+            lease_path.unlink(missing_ok=True)
+        finally:
+            probe.release()
+
+    return active
+
+
+def _wait_for_runtime_quiescence(venv_dir: Path, *, timeout_sec: float, poll_sec: float) -> None:
+    start = time.time()
+    while True:
+        active = _prune_runtime_leases(venv_dir)
+        if not active:
+            return
+        if time.time() - start > timeout_sec:
+            raise TimeoutError(f"Timeout waiting for active venv users to exit: {venv_dir}")
+        time.sleep(poll_sec)
 
 
 def _iter_dep_files(project_root: Path, dep_mode: str, req_file: Path) -> list[Path]:
@@ -280,11 +371,20 @@ def _iter_dep_files(project_root: Path, dep_mode: str, req_file: Path) -> list[P
     return []
 
 
-def _dep_fingerprint(base_python: Path, dep_mode: str, project_root: Path, req_file: Path) -> str:
+def _dep_fingerprint(
+    base_python: Path,
+    dep_mode: str,
+    project_root: Path,
+    req_file: Path,
+    pip_args: list[str],
+    local_first: bool,
+) -> str:
     chunks: list[bytes] = [
         str(base_python).encode(),
         sys.version.encode(),
         dep_mode.encode(),
+        json.dumps(pip_args, ensure_ascii=False).encode("utf-8"),
+        b"1" if local_first else b"0",
     ]
     for f in _iter_dep_files(project_root, dep_mode, req_file):
         chunks.append(str(f).encode())
@@ -398,7 +498,7 @@ def main(argv: list[str]) -> int:
     if dep_mode == "pyproject" and not has_pyproject and not has_req:
         dep_mode = "none"
 
-    dep_hash = _dep_fingerprint(base_python, dep_mode, project_root, req_file)
+    dep_hash = _dep_fingerprint(base_python, dep_mode, project_root, req_file, pip_args, local_first)
 
     if venv_mode == "cache":
         cache_base = Path(os.environ.get("PYWRAP_CACHE_DIR", str(Path.home() / ".cache" / "pywrap")))
@@ -415,7 +515,25 @@ def main(argv: list[str]) -> int:
 
     with _LOCK:
         with FileLock(lock_path, timeout_sec=lock_timeout, poll_sec=lock_poll, verbose=verbose):
-            _cleanup_tmp(venv_dir.parent)
+            _cleanup_tmp(venv_dir.parent, prefix=_tmp_venv_prefix(venv_dir))
+            marker = _load_marker(venv_dir)
+            pending_marker = _load_pending_marker(venv_dir)
+            marker_ok = (
+                isinstance(marker, dict)
+                and marker.get("dep_hash") == dep_hash
+                and marker.get("base_python") == str(base_python)
+                and marker.get("pip_args") == pip_args
+                and marker.get("local_first") == local_first
+            )
+            needs_quiescence = (
+                force_recreate
+                or (venv_dir.exists() and not _venv_python(venv_dir).exists())
+                or pending_marker is not None
+                or (dep_mode != "none" and install_deps and not marker_ok and venv_dir.exists())
+            )
+            if needs_quiescence:
+                _wait_for_runtime_quiescence(venv_dir, timeout_sec=lock_timeout, poll_sec=lock_poll)
+
             _ensure_venv(base_python, venv_dir, force_recreate=force_recreate)
 
             py = _venv_python(venv_dir)
@@ -428,6 +546,7 @@ def main(argv: list[str]) -> int:
                     raise RuntimeError(f"venv python missing: {py}")
 
             marker = _load_marker(venv_dir)
+            pending_marker = _load_pending_marker(venv_dir)
             marker_ok = (
                 isinstance(marker, dict)
                 and marker.get("dep_hash") == dep_hash
@@ -436,8 +555,30 @@ def main(argv: list[str]) -> int:
                 and marker.get("local_first") == local_first
             )
 
-            if not marker_ok and install_deps:
+            if pending_marker is not None and not install_deps:
+                raise RuntimeError(
+                    "dependency installation was interrupted; rerun with "
+                    "PYWRAP_INSTALL_DEPS=1 or recreate the venv"
+                )
+            if pending_marker is not None and dep_mode == "none":
+                raise RuntimeError("dependency installation was interrupted; recreate the venv before continuing")
+
+            if (pending_marker is not None or not marker_ok) and install_deps:
                 if dep_mode != "none":
+                    _write_pending_marker(
+                        venv_dir,
+                        {
+                            "dep_hash": dep_hash,
+                            "dep_mode": dep_mode,
+                            "project_root": str(project_root),
+                            "requirements": str(req_file) if dep_mode == "requirements" else None,
+                            "base_python": str(base_python),
+                            "started_at": int(time.time()),
+                            "python_version": sys.version,
+                            "pip_args": pip_args,
+                            "local_first": local_first,
+                        },
+                    )
                     _install_deps(
                         venv_dir,
                         project_root,
@@ -448,6 +589,7 @@ def main(argv: list[str]) -> int:
                         local_first=local_first,
                     )
 
+                _clear_pending_marker(venv_dir)
                 _write_marker(
                     venv_dir,
                     {
@@ -462,8 +604,12 @@ def main(argv: list[str]) -> int:
                         "local_first": local_first,
                     },
                 )
-            elif not marker_ok and not install_deps:
+            elif pending_marker is None and not marker_ok and not install_deps:
                 _log(verbose, "marker mismatch but PYWRAP_INSTALL_DEPS=0; skipping dependency install")
+
+            runtime_lease = _try_lock_once(_runtime_lease_path(venv_dir), inherit_across_exec=True)
+            if runtime_lease is None:
+                raise RuntimeError("failed to acquire runtime lease")
 
     py = _venv_python(venv_dir)
     os.execv(str(py), [str(py), *argv])
