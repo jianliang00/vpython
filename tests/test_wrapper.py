@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -9,8 +10,20 @@ import time
 import unittest
 from multiprocessing import Event, get_context
 from pathlib import Path
+from typing import Optional
 
 WRAPPER_PATH = Path(__file__).resolve().parents[1] / "python3"
+
+
+def _load_wrapper_module():
+    loader = importlib.machinery.SourceFileLoader("pywrap", str(WRAPPER_PATH))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+WRAPPER_MODULE = _load_wrapper_module()
 
 
 def _run_wrapper(wrapper_path: str, cwd: str, env: dict, args: list[str], queue) -> None:
@@ -25,11 +38,7 @@ def _run_wrapper(wrapper_path: str, cwd: str, env: dict, args: list[str], queue)
 
 
 def _hold_lock(wrapper_path: str, lock_path: str, ready: Event, hold_sec: float) -> None:
-    loader = importlib.machinery.SourceFileLoader("pywrap", wrapper_path)
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-
+    module = _load_wrapper_module()
     lock = module.FileLock(Path(lock_path), timeout_sec=30, poll_sec=0.05)
     lock.acquire()
     try:
@@ -52,7 +61,7 @@ class WrapperTests(unittest.TestCase):
         )
         return env
 
-    def _run_wrapper(self, cwd: str, env: dict, args: list[str] | None = None) -> subprocess.CompletedProcess:
+    def _run_wrapper(self, cwd: str, env: dict, args: Optional[list[str]] = None) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, str(WRAPPER_PATH), *(args or ["-c", "print('ok')"])],
             cwd=cwd,
@@ -63,6 +72,49 @@ class WrapperTests(unittest.TestCase):
 
     def _venv_dir(self, project_root: Path) -> Path:
         return project_root / ".venv"
+
+    def _runtime_dir(self, project_root: Path) -> Path:
+        return self._venv_dir(project_root) / ".pywrap" / "running"
+
+    def _wait_for_runtime_leases(self, runtime_dir: Path, *, min_count: int = 1, timeout: float = 10.0) -> list[Path]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            leases = list(runtime_dir.glob("*.lock"))
+            if len(leases) >= min_count:
+                return leases
+            time.sleep(0.05)
+        self.fail(f"Timed out waiting for runtime leases in {runtime_dir}")
+
+    def _reap_process(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=10)
+
+    def _cache_venv_dir(self, project_root: Path, env: dict) -> Path:
+        dep_mode_env = env.get("PYWRAP_DEP_MODE", "").strip().lower()
+        req_file = Path(env.get("PYWRAP_REQUIREMENTS", str(project_root / "requirements.txt")))
+        has_req = req_file.is_file()
+        has_pyproject = (project_root / "pyproject.toml").is_file()
+
+        dep_mode = dep_mode_env
+        if dep_mode not in ("requirements", "pyproject"):
+            dep_mode = "requirements" if has_req else "pyproject"
+        if dep_mode == "pyproject" and not has_pyproject and not has_req:
+            dep_mode = "none"
+
+        pip_args = shlex.split(env.get("PYWRAP_PIP_ARGS", "").strip())
+        local_first = env.get("PYWRAP_LOCAL_FIRST", "").strip().lower() in ("1", "true", "yes", "y", "on")
+        dep_hash = WRAPPER_MODULE._dep_fingerprint(
+            Path(env["PYWRAP_BASE_PYTHON"]).resolve(),
+            dep_mode,
+            project_root,
+            req_file,
+            pip_args,
+            local_first,
+        )
+        cache_base = Path(env["PYWRAP_CACHE_DIR"])
+        py_tag = f"py{sys.version_info.major}.{sys.version_info.minor}"
+        return cache_base / "venvs" / py_tag / dep_hash[:16]
 
     def test_concurrent_invocations_share_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -240,6 +292,201 @@ class WrapperTests(unittest.TestCase):
             marker = self._venv_dir(Path(tmpdir)) / ".pywrap" / "ok.json"
             data = json.loads(marker.read_text("utf-8"))
             self.assertTrue(data["local_first"])
+
+    def test_force_recreate_waits_for_active_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._base_env()
+            env["PYWRAP_LOCK_TIMEOUT_SEC"] = "10"
+            env["PYWRAP_LOCK_POLL_SEC"] = "0.05"
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            venv_dir = self._venv_dir(Path(tmpdir))
+            sentinel = venv_dir / "sentinel.txt"
+            sentinel.write_text("old", encoding="utf-8")
+
+            runner = subprocess.Popen(
+                [sys.executable, str(WRAPPER_PATH), "-c", "import time; time.sleep(2)"],
+                cwd=tmpdir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                time.sleep(0.5)
+
+                recreate_env = env.copy()
+                recreate_env["PYWRAP_FORCE_RECREATE"] = "1"
+                recreator = subprocess.Popen(
+                    [sys.executable, str(WRAPPER_PATH), "-c", "print('recreated')"],
+                    cwd=tmpdir,
+                    env=recreate_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    time.sleep(0.5)
+                    self.assertIsNone(recreator.poll(), "force recreate should wait for the active runtime lease")
+                    self.assertTrue(sentinel.exists(), "venv should not be recreated while another runtime is active")
+
+                    runner_stdout, runner_stderr = runner.communicate(timeout=10)
+                    self.assertEqual(runner.returncode, 0, runner_stderr or runner_stdout)
+
+                    recreate_stdout, recreate_stderr = recreator.communicate(timeout=10)
+                    self.assertEqual(recreator.returncode, 0, recreate_stderr)
+                    self.assertEqual(recreate_stdout.strip(), "recreated")
+                    self.assertFalse(sentinel.exists(), "force recreate should replace the old venv after the lease ends")
+                finally:
+                    if recreator.poll() is None:
+                        recreator.kill()
+                        recreator.wait(timeout=10)
+            finally:
+                if runner.poll() is None:
+                    self._reap_process(runner)
+
+    def test_force_recreate_times_out_while_runtime_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._base_env()
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            runner = subprocess.Popen(
+                [sys.executable, str(WRAPPER_PATH), "-c", "import time; time.sleep(5)"],
+                cwd=tmpdir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self._wait_for_runtime_leases(self._runtime_dir(Path(tmpdir)))
+
+                recreate_env = env.copy()
+                recreate_env["PYWRAP_FORCE_RECREATE"] = "1"
+                recreate_env["PYWRAP_LOCK_TIMEOUT_SEC"] = "1"
+                recreate_env["PYWRAP_LOCK_POLL_SEC"] = "0.05"
+                result = self._run_wrapper(tmpdir, recreate_env, ["-c", "print('recreated')"])
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Timeout waiting for active venv users to exit", result.stderr)
+            finally:
+                self._reap_process(runner)
+
+    def test_pending_marker_blocks_reuse_without_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            pending = self._venv_dir(Path(tmpdir)) / ".pywrap" / "installing.json"
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            pending.write_text(json.dumps({"dep_hash": "incomplete"}) + "\n", encoding="utf-8")
+
+            result = self._run_wrapper(tmpdir, env)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("dependency installation was interrupted", result.stderr)
+
+    def test_pending_marker_recovers_with_install_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+            env = self._base_env()
+            env["PYWRAP_INSTALL_DEPS"] = "1"
+            env["PYWRAP_UPGRADE_PIP"] = "0"
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            marker = self._venv_dir(Path(tmpdir)) / ".pywrap" / "ok.json"
+            before = json.loads(marker.read_text("utf-8"))
+            time.sleep(1.1)
+
+            pending = self._venv_dir(Path(tmpdir)) / ".pywrap" / "installing.json"
+            pending.write_text(json.dumps({"dep_hash": "incomplete"}) + "\n", encoding="utf-8")
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(pending.exists())
+
+            after = json.loads(marker.read_text("utf-8"))
+            self.assertGreaterEqual(after["created_at"], before["created_at"] + 1)
+            self.assertEqual(Path(after["requirements"]).resolve(), (Path(tmpdir) / "requirements.txt").resolve())
+
+    def test_cache_mode_keys_include_pip_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as cache_dir:
+            Path(tmpdir, "requirements.txt").write_text("", encoding="utf-8")
+
+            env_a = self._base_env()
+            env_a["PYWRAP_VENV_MODE"] = "cache"
+            env_a["PYWRAP_CACHE_DIR"] = cache_dir
+            env_a["PYWRAP_PIP_ARGS"] = "--index-url https://example.com/simple"
+
+            env_b = self._base_env()
+            env_b["PYWRAP_VENV_MODE"] = "cache"
+            env_b["PYWRAP_CACHE_DIR"] = cache_dir
+            env_b["PYWRAP_PIP_ARGS"] = "--extra-index-url https://example.com/extra"
+
+            result_a = self._run_wrapper(tmpdir, env_a)
+            result_b = self._run_wrapper(tmpdir, env_b)
+
+            self.assertEqual(result_a.returncode, 0, result_a.stderr)
+            self.assertEqual(result_b.returncode, 0, result_b.stderr)
+            self.assertNotEqual(
+                self._cache_venv_dir(Path(tmpdir), env_a),
+                self._cache_venv_dir(Path(tmpdir), env_b),
+            )
+
+    def test_tmp_cleanup_only_removes_matching_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir)
+            venv_a = parent / "venv-a"
+            venv_b = parent / "venv-b"
+            tmp_a = parent / f"{WRAPPER_MODULE._tmp_venv_prefix(venv_a)}leftover"
+            tmp_b = parent / f"{WRAPPER_MODULE._tmp_venv_prefix(venv_b)}leftover"
+            tmp_a.mkdir()
+            tmp_b.mkdir()
+
+            WRAPPER_MODULE._cleanup_tmp(parent, prefix=WRAPPER_MODULE._tmp_venv_prefix(venv_a))
+
+            self.assertFalse(tmp_a.exists())
+            self.assertTrue(tmp_b.exists())
+
+    def test_stale_runtime_lease_is_pruned_after_process_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._base_env()
+
+            result = self._run_wrapper(tmpdir, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            runner = subprocess.Popen(
+                [sys.executable, str(WRAPPER_PATH), "-c", "import time; time.sleep(10)"],
+                cwd=tmpdir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                leases = self._wait_for_runtime_leases(self._runtime_dir(Path(tmpdir)))
+                stale_lease = leases[0]
+                self.assertTrue(stale_lease.exists())
+            finally:
+                self._reap_process(runner)
+
+            self.assertTrue(stale_lease.exists(), "Killed runtime should leave a stale lease file behind")
+
+            recreate_env = env.copy()
+            recreate_env["PYWRAP_FORCE_RECREATE"] = "1"
+            recreate_result = self._run_wrapper(tmpdir, recreate_env, ["-c", "print('recreated')"])
+
+            self.assertEqual(recreate_result.returncode, 0, recreate_result.stderr)
+            self.assertFalse(stale_lease.exists(), "Next recreate should prune stale runtime lease files")
 
 
 if __name__ == "__main__":
