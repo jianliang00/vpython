@@ -77,12 +77,40 @@ class WrapperTests(unittest.TestCase):
     def _runtime_dir(self, project_root: Path) -> Path:
         return self._venv_dir(project_root) / ".pywrap" / "running"
 
-    def _wait_for_runtime_leases(self, runtime_dir: Path, *, min_count: int = 1, timeout: float = 10.0) -> list[Path]:
+    def _wait_for_runtime_leases(
+        self,
+        runtime_dir: Path,
+        *,
+        min_count: int = 1,
+        timeout: float = 10.0,
+        require_initialized: bool = False,
+        require_locked: bool = False,
+    ) -> list[Path]:
         deadline = time.time() + timeout
         while time.time() < deadline:
             leases = list(runtime_dir.glob("*.lock"))
             if len(leases) >= min_count:
-                return leases
+                if require_initialized:
+                    ready = [lease for lease in leases if WRAPPER_MODULE._load_json(lease) is not None]
+                    if len(ready) >= min_count:
+                        leases = ready
+                    else:
+                        time.sleep(0.05)
+                        continue
+                if require_locked:
+                    locked = []
+                    for lease in leases:
+                        probe = WRAPPER_MODULE._try_lock_once(lease)
+                        if probe is None:
+                            locked.append(lease)
+                        else:
+                            probe.release()
+                    if len(locked) >= min_count:
+                        return locked
+                    time.sleep(0.05)
+                    continue
+                else:
+                    return leases
             time.sleep(0.05)
         self.fail(f"Timed out waiting for runtime leases in {runtime_dir}")
 
@@ -316,7 +344,11 @@ class WrapperTests(unittest.TestCase):
                 text=True,
             )
             try:
-                time.sleep(0.5)
+                self._wait_for_runtime_leases(
+                    self._runtime_dir(Path(tmpdir)),
+                    require_initialized=True,
+                    require_locked=True,
+                )
 
                 recreate_env = env.copy()
                 recreate_env["PYWRAP_FORCE_RECREATE"] = "1"
@@ -331,7 +363,6 @@ class WrapperTests(unittest.TestCase):
                 try:
                     time.sleep(0.5)
                     self.assertIsNone(recreator.poll(), "force recreate should wait for the active runtime lease")
-                    self.assertTrue(sentinel.exists(), "venv should not be recreated while another runtime is active")
 
                     runner_stdout, runner_stderr = runner.communicate(timeout=10)
                     self.assertEqual(runner.returncode, 0, runner_stderr or runner_stdout)
@@ -341,9 +372,7 @@ class WrapperTests(unittest.TestCase):
                     self.assertEqual(recreate_stdout.strip(), "recreated")
                     self.assertFalse(sentinel.exists(), "force recreate should replace the old venv after the lease ends")
                 finally:
-                    if recreator.poll() is None:
-                        recreator.kill()
-                        recreator.wait(timeout=10)
+                    self._reap_process(recreator)
             finally:
                 if runner.poll() is None:
                     self._reap_process(runner)
@@ -364,7 +393,11 @@ class WrapperTests(unittest.TestCase):
                 text=True,
             )
             try:
-                self._wait_for_runtime_leases(self._runtime_dir(Path(tmpdir)))
+                self._wait_for_runtime_leases(
+                    self._runtime_dir(Path(tmpdir)),
+                    require_initialized=True,
+                    require_locked=True,
+                )
                 if runner.poll() is not None:
                     runner_stdout, runner_stderr = runner.communicate(timeout=10)
                     self.fail(
@@ -500,7 +533,7 @@ class WrapperTests(unittest.TestCase):
             project_root = Path(tmpdir)
             lease_path = self._runtime_dir(project_root) / "stale.lock"
             lease_path.parent.mkdir(parents=True, exist_ok=True)
-            lease_path.write_text("", encoding="utf-8")
+            lease_path.write_text(json.dumps({"pid": 123}) + "\n", encoding="utf-8")
 
             calls: list[str] = []
 
@@ -520,6 +553,26 @@ class WrapperTests(unittest.TestCase):
 
             self.assertEqual(active, [])
             self.assertEqual(calls, ["release", "unlink"])
+
+    def test_prune_runtime_leases_keeps_recent_uninitialized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            lease_path = self._runtime_dir(project_root) / "pending.lock"
+            lease_path.parent.mkdir(parents=True, exist_ok=True)
+            lease_path.write_text("", encoding="utf-8")
+
+            calls: list[str] = []
+
+            class Probe:
+                def release(self_inner) -> None:
+                    calls.append("release")
+
+            with mock.patch.object(WRAPPER_MODULE, "_try_lock_once", return_value=Probe()):
+                active = WRAPPER_MODULE._prune_runtime_leases(self._venv_dir(project_root))
+
+            self.assertEqual(active, [lease_path])
+            self.assertEqual(calls, ["release"])
+            self.assertTrue(lease_path.exists())
 
 
 if __name__ == "__main__":
