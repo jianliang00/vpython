@@ -321,15 +321,32 @@ def _try_lock_once(lock_path: Path, *, inherit_across_exec: bool = False) -> Opt
         return None
 
 
+def _lease_ready_for_prune(lease_path: Path, *, now: Optional[float] = None, grace_sec: float = 2.0) -> bool:
+    if _load_json(lease_path) is not None:
+        return True
+    try:
+        mtime = lease_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    if now is None:
+        now = time.time()
+    return now - mtime >= grace_sec
+
+
 def _prune_runtime_leases(venv_dir: Path) -> list[Path]:
     runtime_dir = _runtime_dir(venv_dir)
     if not runtime_dir.exists():
         return []
 
     active: list[Path] = []
+    now = time.time()
     for lease_path in runtime_dir.glob("*.lock"):
         probe = _try_lock_once(lease_path)
         if probe is None:
+            active.append(lease_path)
+            continue
+        if not _lease_ready_for_prune(lease_path, now=now):
+            probe.release()
             active.append(lease_path)
             continue
         probe.release()
