@@ -332,10 +332,8 @@ def _prune_runtime_leases(venv_dir: Path) -> list[Path]:
         if probe is None:
             active.append(lease_path)
             continue
-        try:
-            lease_path.unlink(missing_ok=True)
-        finally:
-            probe.release()
+        probe.release()
+        lease_path.unlink(missing_ok=True)
 
     return active
 

@@ -11,6 +11,7 @@ import unittest
 from multiprocessing import Event, get_context
 from pathlib import Path
 from typing import Optional
+from unittest import mock
 
 WRAPPER_PATH = Path(__file__).resolve().parents[1] / "python3"
 
@@ -355,7 +356,7 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
             runner = subprocess.Popen(
-                [sys.executable, str(WRAPPER_PATH), "-c", "import time; time.sleep(5)"],
+                [sys.executable, str(WRAPPER_PATH), "-c", "import time; time.sleep(10)"],
                 cwd=tmpdir,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -364,6 +365,12 @@ class WrapperTests(unittest.TestCase):
             )
             try:
                 self._wait_for_runtime_leases(self._runtime_dir(Path(tmpdir)))
+                if runner.poll() is not None:
+                    runner_stdout, runner_stderr = runner.communicate(timeout=10)
+                    self.fail(
+                        "runtime exited before timeout assertion: "
+                        f"rc={runner.returncode} stdout={runner_stdout!r} stderr={runner_stderr!r}"
+                    )
 
                 recreate_env = env.copy()
                 recreate_env["PYWRAP_FORCE_RECREATE"] = "1"
@@ -487,6 +494,32 @@ class WrapperTests(unittest.TestCase):
 
             self.assertEqual(recreate_result.returncode, 0, recreate_result.stderr)
             self.assertFalse(stale_lease.exists(), "Next recreate should prune stale runtime lease files")
+
+    def test_prune_runtime_leases_releases_before_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            lease_path = self._runtime_dir(project_root) / "stale.lock"
+            lease_path.parent.mkdir(parents=True, exist_ok=True)
+            lease_path.write_text("", encoding="utf-8")
+
+            calls: list[str] = []
+
+            class Probe:
+                def release(self_inner) -> None:
+                    calls.append("release")
+
+            def unlink_side_effect(path_self: Path, *, missing_ok: bool = False) -> None:
+                self.assertTrue(missing_ok)
+                self.assertEqual(path_self, lease_path)
+                self.assertEqual(calls, ["release"])
+                calls.append("unlink")
+
+            with mock.patch.object(WRAPPER_MODULE, "_try_lock_once", return_value=Probe()):
+                with mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink_side_effect):
+                    active = WRAPPER_MODULE._prune_runtime_leases(self._venv_dir(project_root))
+
+            self.assertEqual(active, [])
+            self.assertEqual(calls, ["release", "unlink"])
 
 
 if __name__ == "__main__":
