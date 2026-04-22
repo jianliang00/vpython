@@ -122,12 +122,14 @@ class FileLock:
         poll_sec: float = 0.2,
         verbose: bool = False,
         inherit_across_exec: bool = False,
+        write_metadata: bool = True,
     ):
         self.lock_path = lock_path
         self.timeout_sec = timeout_sec
         self.poll_sec = poll_sec
         self.verbose = verbose
         self.inherit_across_exec = inherit_across_exec
+        self.write_metadata = write_metadata
         self._fd: Optional[int] = None
 
     def _nt_seek0(self) -> None:
@@ -166,19 +168,20 @@ class FileLock:
                     self._nt_seek0()
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
-                # best-effort: write owner metadata for debugging
-                try:
-                    meta = {
-                        "pid": os.getpid(),
-                        "host": platform.node(),
-                        "acquired_at": int(time.time()),
-                    }
-                    os.ftruncate(fd, 0)
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    os.write(fd, (json.dumps(meta, ensure_ascii=False) + "\n").encode("utf-8"))
-                    os.fsync(fd)
-                except Exception:
-                    pass
+                if self.write_metadata:
+                    # best-effort: write owner metadata for debugging
+                    try:
+                        meta = {
+                            "pid": os.getpid(),
+                            "host": platform.node(),
+                            "acquired_at": int(time.time()),
+                        }
+                        os.ftruncate(fd, 0)
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        os.write(fd, (json.dumps(meta, ensure_ascii=False) + "\n").encode("utf-8"))
+                        os.fsync(fd)
+                    except Exception:
+                        pass
 
                 return
             except OSError:
@@ -307,12 +310,18 @@ def _runtime_lease_path(venv_dir: Path) -> Path:
     return _runtime_dir(venv_dir) / f"{token}.lock"
 
 
-def _try_lock_once(lock_path: Path, *, inherit_across_exec: bool = False) -> Optional[FileLock]:
+def _try_lock_once(
+    lock_path: Path,
+    *,
+    inherit_across_exec: bool = False,
+    write_metadata: bool = True,
+) -> Optional[FileLock]:
     lock = FileLock(
         lock_path,
         timeout_sec=0,
         poll_sec=0,
         inherit_across_exec=inherit_across_exec,
+        write_metadata=write_metadata,
     )
     try:
         lock.acquire()
@@ -322,8 +331,6 @@ def _try_lock_once(lock_path: Path, *, inherit_across_exec: bool = False) -> Opt
 
 
 def _lease_ready_for_prune(lease_path: Path, *, now: Optional[float] = None, grace_sec: float = 2.0) -> bool:
-    if _load_json(lease_path) is not None:
-        return True
     try:
         mtime = lease_path.stat().st_mtime
     except FileNotFoundError:
@@ -341,12 +348,17 @@ def _prune_runtime_leases(venv_dir: Path) -> list[Path]:
     active: list[Path] = []
     now = time.time()
     for lease_path in runtime_dir.glob("*.lock"):
-        probe = _try_lock_once(lease_path)
-        if probe is None:
+        if not _lease_ready_for_prune(lease_path, now=now):
             active.append(lease_path)
             continue
-        if not _lease_ready_for_prune(lease_path, now=now):
-            probe.release()
+        try:
+            if lease_path.stat().st_size == 0:
+                lease_path.unlink(missing_ok=True)
+                continue
+        except FileNotFoundError:
+            continue
+        probe = _try_lock_once(lease_path, write_metadata=False)
+        if probe is None:
             active.append(lease_path)
             continue
         probe.release()

@@ -100,7 +100,7 @@ class WrapperTests(unittest.TestCase):
                 if require_locked:
                     locked = []
                     for lease in leases:
-                        probe = WRAPPER_MODULE._try_lock_once(lease)
+                        probe = WRAPPER_MODULE._try_lock_once(lease, write_metadata=False)
                         if probe is None:
                             locked.append(lease)
                         else:
@@ -346,7 +346,6 @@ class WrapperTests(unittest.TestCase):
             try:
                 self._wait_for_runtime_leases(
                     self._runtime_dir(Path(tmpdir)),
-                    require_initialized=True,
                     require_locked=True,
                 )
 
@@ -395,7 +394,6 @@ class WrapperTests(unittest.TestCase):
             try:
                 self._wait_for_runtime_leases(
                     self._runtime_dir(Path(tmpdir)),
-                    require_initialized=True,
                     require_locked=True,
                 )
                 if runner.poll() is not None:
@@ -547,9 +545,10 @@ class WrapperTests(unittest.TestCase):
                 self.assertEqual(calls, ["release"])
                 calls.append("unlink")
 
-            with mock.patch.object(WRAPPER_MODULE, "_try_lock_once", return_value=Probe()):
-                with mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink_side_effect):
-                    active = WRAPPER_MODULE._prune_runtime_leases(self._venv_dir(project_root))
+            with mock.patch.object(WRAPPER_MODULE, "_lease_ready_for_prune", return_value=True):
+                with mock.patch.object(WRAPPER_MODULE, "_try_lock_once", return_value=Probe()):
+                    with mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink_side_effect):
+                        active = WRAPPER_MODULE._prune_runtime_leases(self._venv_dir(project_root))
 
             self.assertEqual(active, [])
             self.assertEqual(calls, ["release", "unlink"])
@@ -571,7 +570,7 @@ class WrapperTests(unittest.TestCase):
                 active = WRAPPER_MODULE._prune_runtime_leases(self._venv_dir(project_root))
 
             self.assertEqual(active, [lease_path])
-            self.assertEqual(calls, ["release"])
+            self.assertEqual(calls, [])
             self.assertTrue(lease_path.exists())
 
 
