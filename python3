@@ -310,90 +310,6 @@ def _runtime_lease_path(venv_dir: Path) -> Path:
     return _runtime_dir(venv_dir) / f"{token}.lock"
 
 
-_RUNTIME_LEASE_HOOK = r'''
-import json
-import os
-import platform
-import time
-
-_pywrap_runtime_lease_fd = None
-
-
-def _pywrap_acquire_runtime_lease():
-    global _pywrap_runtime_lease_fd
-    lease_path = os.environ.pop("PYWRAP_RUNTIME_LEASE", "")
-    if not lease_path:
-        return
-
-    fd = None
-    try:
-        os.makedirs(os.path.dirname(lease_path), exist_ok=True)
-        fd = os.open(lease_path, os.O_RDWR | os.O_CREAT, 0o600)
-        import msvcrt
-
-        try:
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-        except OSError:
-            pass
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-
-        try:
-            meta = {
-                "pid": os.getpid(),
-                "host": platform.node(),
-                "acquired_at": int(time.time()),
-            }
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, (json.dumps(meta, ensure_ascii=False) + "\n").encode("utf-8"))
-            os.fsync(fd)
-        except Exception:
-            pass
-
-        _pywrap_runtime_lease_fd = fd
-        fd = None
-    except Exception:
-        pass
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-_pywrap_acquire_runtime_lease()
-'''
-
-
-def _site_packages_dir(venv_dir: Path) -> Path:
-    if os.name == "nt":
-        return venv_dir / "Lib" / "site-packages"
-    return venv_dir / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-
-
-def _ensure_runtime_lease_hook(venv_dir: Path) -> None:
-    if os.name != "nt":
-        return
-
-    site_packages = _site_packages_dir(venv_dir)
-    module_path = site_packages / "_pywrap_runtime.py"
-    pth_path = site_packages / "_pywrap_runtime.pth"
-    module_text = _RUNTIME_LEASE_HOOK.lstrip()
-    pth_text = "import _pywrap_runtime\n"
-
-    current_module = module_path.read_text("utf-8") if module_path.exists() else None
-    current_pth = pth_path.read_text("utf-8") if pth_path.exists() else None
-
-    if current_module != module_text:
-        _atomic_write_text(module_path, module_text, "utf-8")
-    if current_pth != pth_text:
-        _atomic_write_text(pth_path, pth_text, "utf-8")
-
-
 def _try_lock_once(
     lock_path: Path,
     *,
@@ -462,20 +378,112 @@ def _wait_for_runtime_quiescence(venv_dir: Path, *, timeout_sec: float, poll_sec
         time.sleep(poll_sec)
 
 
-def _handoff_to_venv_python(
-    py: Path,
-    argv: list[str],
-    *,
-    runtime_lease: Optional[FileLock],
-    runtime_lease_path: Path,
-) -> int:
-    if os.name == "nt":
-        os.environ["PYWRAP_RUNTIME_LEASE"] = str(runtime_lease_path)
-        os.execv(str(py), [str(py), *argv])
-        return 0
+def _create_kill_on_close_job() -> Optional[int]:
+    if os.name != "nt":
+        return None
 
-    if runtime_lease is None:
-        raise RuntimeError("failed to acquire runtime lease")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+        return int(job)
+    except Exception:
+        return None
+
+
+def _assign_process_to_job(job: Optional[int], proc: subprocess.Popen) -> None:
+    if os.name != "nt" or job is None:
+        return
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject(job, proc._handle)
+    except Exception:
+        pass
+
+
+def _close_handle(handle: Optional[int]) -> None:
+    if os.name != "nt" or handle is None:
+        return
+
+    try:
+        import ctypes
+
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def _handoff_to_venv_python(py: Path, argv: list[str], runtime_lease: FileLock) -> int:
+    if os.name == "nt":
+        job = _create_kill_on_close_job()
+        try:
+            proc = subprocess.Popen([str(py), *argv])
+            _assign_process_to_job(job, proc)
+            return proc.wait()
+        finally:
+            runtime_lease.release()
+            try:
+                runtime_lease.lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            _close_handle(job)
+
     os.execv(str(py), [str(py), *argv])
     return 0
 
@@ -736,25 +744,12 @@ def main(argv: list[str]) -> int:
             elif pending_marker is None and not marker_ok and not install_deps:
                 _log(verbose, "marker mismatch but PYWRAP_INSTALL_DEPS=0; skipping dependency install")
 
-            runtime_lease_path = _runtime_lease_path(venv_dir)
-            runtime_lease: Optional[FileLock]
-            if os.name == "nt":
-                _ensure_runtime_lease_hook(venv_dir)
-                runtime_lease_path.parent.mkdir(parents=True, exist_ok=True)
-                runtime_lease_path.touch()
-                runtime_lease = None
-            else:
-                runtime_lease = _try_lock_once(runtime_lease_path, inherit_across_exec=True)
-                if runtime_lease is None:
-                    raise RuntimeError("failed to acquire runtime lease")
+            runtime_lease = _try_lock_once(_runtime_lease_path(venv_dir), inherit_across_exec=True)
+            if runtime_lease is None:
+                raise RuntimeError("failed to acquire runtime lease")
 
     py = _venv_python(venv_dir)
-    return _handoff_to_venv_python(
-        py,
-        argv,
-        runtime_lease=runtime_lease,
-        runtime_lease_path=runtime_lease_path,
-    )
+    return _handoff_to_venv_python(py, argv, runtime_lease)
 
 
 if __name__ == "__main__":
