@@ -116,7 +116,15 @@ class WrapperTests(unittest.TestCase):
 
     def _reap_process(self, proc: subprocess.Popen) -> None:
         if proc.poll() is None:
-            proc.kill()
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                proc.kill()
         proc.communicate(timeout=10)
 
     def _cache_venv_dir(self, project_root: Path, env: dict) -> Path:
