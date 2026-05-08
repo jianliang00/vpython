@@ -378,6 +378,22 @@ def _wait_for_runtime_quiescence(venv_dir: Path, *, timeout_sec: float, poll_sec
         time.sleep(poll_sec)
 
 
+def _handoff_to_venv_python(py: Path, argv: list[str], runtime_lease: FileLock) -> int:
+    if os.name == "nt":
+        # Keep the wrapper process alive so msvcrt's byte-range lock protects the child.
+        try:
+            return subprocess.call([str(py), *argv])
+        finally:
+            runtime_lease.release()
+            try:
+                runtime_lease.lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    os.execv(str(py), [str(py), *argv])
+    return 0
+
+
 def _iter_dep_files(project_root: Path, dep_mode: str, req_file: Path) -> list[Path]:
     if dep_mode == "requirements":
         files = [req_file]
@@ -639,13 +655,12 @@ def main(argv: list[str]) -> int:
                 raise RuntimeError("failed to acquire runtime lease")
 
     py = _venv_python(venv_dir)
-    os.execv(str(py), [str(py), *argv])
-    return 0
+    return _handoff_to_venv_python(py, argv, runtime_lease)
 
 
 if __name__ == "__main__":
     try:
-        main(sys.argv[1:])
+        sys.exit(main(sys.argv[1:]))
     except subprocess.CalledProcessError as e:
         print(f"[pywrap] command failed: {e}", file=sys.stderr)
         sys.exit(e.returncode)
